@@ -25,6 +25,8 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_DIR = os.path.join(os.path.expanduser("~"), ".codex-dashboard", "state")
 RUNS_DIR = os.path.join(os.path.expanduser("~"), ".codex-dashboard", "runs")
 IS_WIN = os.name == "nt"
+TOKEN_HISTORY = 30 * 60     # seconds of per-response token records kept for the throughput view
+RATE_WINDOW = 5 * 60        # the headline tokens/s figure is averaged over this window
 MY_PID = os.getpid()
 
 # ---------------------------------------------------------------------------------------------
@@ -539,6 +541,8 @@ class Session:
         self.names = ("", "")
         self.names_stale = True
         self.recent_exits = collections.deque(maxlen=20)   # exit codes of the latest commands
+        self.token_log = collections.deque()  # (ts, output, reasoning, input) per model response, last TOKEN_HISTORY s
+        self._scanning = False
         self.run = None                 # metadata written by `cx run` for managed workers
 
     # -- summary maintenance ---------------------------------------------------------------
@@ -547,6 +551,10 @@ class Session:
         ts = parse_ts(rec.get("timestamp", ""))
         if ts:
             self.last_ts = max(self.last_ts, ts)
+        if typ == "token_usage_record":
+            if not self._scanning:  # the initial scan backfills these separately
+                self.log_tokens(ts, p)
+            return
         if typ == "turn_context":
             self.model = p.get("model") or self.model
             self.effort = p.get("effort") or p.get("reasoning_effort") or self.effort
@@ -608,8 +616,41 @@ class Session:
                 continue
             self.apply(rec)
 
+    def log_tokens(self, ts, payload):
+        u = payload.get("usage") or {}
+        if ts:
+            self.token_log.append((ts, u.get("output_tokens", 0), u.get("reasoning_output_tokens", 0),
+                                   u.get("input_tokens", 0)))
+        cutoff = time.time() - TOKEN_HISTORY
+        while self.token_log and self.token_log[0][0] < cutoff:
+            self.token_log.popleft()
+
+    def backfill_tokens(self):
+        """Token records of the last TOKEN_HISTORY seconds, from the file end (cheap byte filter)."""
+        if self.last_ts < time.time() - TOKEN_HISTORY:
+            return
+        start = max(0, self.offset - (4 << 20))
+        with open_shared(self.path) as f:
+            f.seek(start)
+            data = f.read(self.offset - start)
+        for line in data.split(b"\n")[1 if start else 0:]:
+            if b'"token_usage_record"' in line[:120]:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                self.log_tokens(parse_ts(rec.get("timestamp", "")), rec.get("payload") or {})
+
     def initial_scan(self):
         """Read the head (prompt/model) and the tail (latest state) without parsing everything."""
+        self._scanning = True
+        try:
+            self._initial_scan()
+        finally:
+            self._scanning = False
+        self.backfill_tokens()
+
+    def _initial_scan(self):
         with open_shared(self.path) as f:
             size = f.seek(0, 2)
             f.seek(0)
@@ -1076,7 +1117,38 @@ class Monitor:
             counts = collections.Counter(r["status"] for r in rows)
             return {"now": now, "ready": self.ready, "codex_home": self.home,
                     "history_hours": self.history / 3600, "sessions": rows,
+                    "throughput": self.throughput(now),
                     "counts": {"running": counts["running"], "done": counts["done"], "failed": counts["failed"]}}
+
+    def throughput(self, now):
+        """Generated (output) tokens/s per model: RATE_WINDOW average plus one value per completed
+        minute over TOKEN_HISTORY, so adding agents shows up as a step in the sparkline."""
+        minutes = TOKEN_HISTORY // 60
+        cur_min = int(now // 60)
+        models = {}
+        for s in self.sessions.values():
+            model = s.model or "?"
+            m = models.setdefault(model, {"model": model, "out": 0, "reasoning": 0, "agents": 0,
+                                          "series": [0] * minutes})
+            if s.live:
+                m["agents"] += 1
+            for ts, out, reasoning, _inp in s.token_log:
+                if now - ts <= RATE_WINDOW:
+                    m["out"] += out
+                    m["reasoning"] += reasoning
+                idx = cur_min - 1 - int(ts // 60)  # 0 = last completed minute
+                if 0 <= idx < minutes:
+                    m["series"][minutes - 1 - idx] += out
+        rows = []
+        for m in models.values():
+            if not m["agents"] and not any(m["series"]) and not m["out"]:
+                continue
+            rows.append({"model": m["model"], "agents": m["agents"],
+                         "tps": round(m["out"] / RATE_WINDOW, 1),
+                         "reasoning_tps": round(m["reasoning"] / RATE_WINDOW, 1),
+                         "series": [round(v / 60, 1) for v in m["series"]]})
+        rows.sort(key=lambda r: -r["tps"])
+        return {"window": RATE_WINDOW, "models": rows}
 
     def session_path(self, sid):
         with self.lock:

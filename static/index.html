@@ -34,6 +34,11 @@ header h1 { font-size: 17px; margin: 0; font-weight: 650; letter-spacing: .2px; 
 .count b { font-weight: 700; margin-left: 4px; color: var(--text); }
 .count.running b { color: var(--run); } .count.failed b { color: var(--fail); }
 .count.on { background: var(--sel); border-color: var(--accent); }
+.tput { display: flex; gap: 14px; flex-wrap: wrap; }
+.tp { display: flex; align-items: center; gap: 7px; font-size: 13px; white-space: nowrap; }
+.tp b { font-size: 15px; font-variant-numeric: tabular-nums; }
+.tp svg { display: block; }
+.tp .bar { fill: var(--accent); opacity: .75; }
 .filters { display: flex; gap: 8px; margin-left: auto; flex-wrap: wrap; }
 .filters select, .filters input { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
 .filters input { width: 220px; }
@@ -113,6 +118,7 @@ tr.row.sel td { background: var(--sel); }
     <button class="count done" data-f="done">finished<b id="c-done">0</b></button>
     <button class="count failed" data-f="failed">failed<b id="c-failed">0</b></button>
   </div>
+  <div id="tput" class="tput"></div>
   <div class="filters">
     <select id="f-project"><option value="">all projects</option></select>
     <select id="f-status">
@@ -220,6 +226,23 @@ function renderCounts() {
     sel.dataset.opts = want;
     sel.value = projects.includes(val) ? val : "";
   }
+}
+
+function renderThroughput() {
+  const tp = STATE.throughput || {models: []};
+  const peak = Math.max(1, ...tp.models.flatMap((m) => [...m.series, m.tps]));
+  const W = 120, H = 22, n = 30, bw = W / n;
+  $("#tput").innerHTML = tp.models.map((m) => {
+    const bars = m.series.map((v, i) => {
+      const h = Math.max(v > 0 ? 1 : 0, (v / peak) * H);
+      return `<rect class="bar" x="${(i * bw).toFixed(1)}" y="${(H - h).toFixed(1)}" width="${(bw - 1).toFixed(1)}" height="${h.toFixed(1)}"></rect>`;
+    }).join("");
+    const tip = `${m.model}: ${m.tps} output tokens/s averaged over the last ${tp.window / 60} min ` +
+      `(${m.reasoning_tps} of it reasoning), ${m.agents} running agents.\nBars: tokens/s per minute, last 30 min (peak ${Math.max(...m.series)}).`;
+    return `<div class="tp" title="${esc(tip)}"><b>${Math.round(m.tps)}</b><span>tok/s</span>
+      <span class="dim">${esc(m.model)} · ${m.agents} agent${m.agents === 1 ? "" : "s"}</span>
+      <svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" aria-hidden="true">${bars}</svg></div>`;
+  }).join("");
 }
 
 // ---------------------------------------------------------------- detail
@@ -340,7 +363,7 @@ async function poll() {
     const res = await fetch("/api/state", {cache: "no-store"});
     STATE = await res.json();
     CLOCK = Date.now() / 1000;
-    renderCounts(); renderList();
+    renderCounts(); renderThroughput(); renderList();
     if (SEL) renderDetailHead();
   } catch (e) {
     $("#list").innerHTML = `<div class="empty">Dashboard server not reachable – is <code>codex-dashboard</code> running?</div>`;

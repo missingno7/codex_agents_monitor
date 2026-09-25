@@ -22,6 +22,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNS_DIR = os.path.join(os.path.expanduser("~"), ".codex-dashboard", "runs")
+EXIT_GRACE = 60  # seconds codex may linger after reporting its turn finished before cx stops it
 
 
 def find_codex():
@@ -168,7 +169,7 @@ def cmd_run(a):
     err_thread.start()
     threading.Thread(target=feed_stdin, daemon=True).start()
 
-    st = {"sid": a.resume, "final": None, "errors": [], "failed": False}
+    st = {"sid": a.resume, "final": None, "errors": [], "failed": False, "turn_done": None}
 
     def read_events():
         for raw in proc.stdout:
@@ -186,13 +187,26 @@ def cmd_run(a):
                     st["final"] = item.get("text")
             elif t == "turn.failed":
                 st["failed"] = True
+                st["turn_done"] = time.time()
                 st["errors"].append(error_text(ev.get("error")))
+            elif t == "turn.completed":
+                st["turn_done"] = time.time()
             elif t == "error":
                 st["errors"].append(error_text(ev))
 
     out_thread = threading.Thread(target=read_events, daemon=True)
     out_thread.start()
-    code = proc.wait()
+    # Codex has been seen to hang after finishing its turn (observed 2026-09-25 with `exec resume`:
+    # task_complete written, process idle for 20+ min). Don't let that block the supervisor forever.
+    stuck = False
+    while True:
+        try:
+            code = proc.wait(timeout=5)
+            break
+        except subprocess.TimeoutExpired:
+            if st["turn_done"] and time.time() - st["turn_done"] > EXIT_GRACE:
+                stuck = True
+                proc.kill()
     # Bounded joins: a sandboxed grandchild may inherit stdout/stderr and keep them open after codex exits.
     out_thread.join(timeout=10)
     err_thread.join(timeout=5)
@@ -204,7 +218,7 @@ def cmd_run(a):
             break
         except RuntimeError:  # still being appended to
             time.sleep(0.05)
-    ok = code == 0 and not failed
+    ok = (code == 0 or stuck) and not failed  # stuck implies the turn had already finished
     status = "DONE" if ok else "FAILED"
     if sid:
         write_run(sid, {"status": status.lower(), "exit_code": code, "ended": time.time()})
@@ -214,6 +228,7 @@ def cmd_run(a):
     head = f"[cx] {name} · {status}" + ("" if ok else f" (exit {code})") + f" · {dur(time.time() - t0)}"
     head += f" · {model or '?'}/{effort or '?'}" if (model or effort) else ""
     head += f" · session {sid}" if sid else ""
+    head += f" · (codex did not exit {EXIT_GRACE}s after finishing; stopped it)" if stuck else ""
     print(head)
     if ok:
         print(final if final is not None else "(worker finished without a final message)")
