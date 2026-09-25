@@ -69,6 +69,23 @@ def bind_to_our_lifetime(proc):
         pass
 
 
+def session_settings(sid):
+    """(model, effort) of a session's latest turn, from its Codex rollout; (None, None) if unknown."""
+    home = os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
+    paths = glob.glob(os.path.join(home, "sessions", "*", "*", "*", f"rollout-*-{sid}.jsonl"))
+    model = effort = None
+    try:
+        with open(paths[0], "rb") as f:
+            for line in f:
+                if b'"turn_context"' in line[:120]:
+                    p = json.loads(line).get("payload") or {}
+                    model = p.get("model") or model
+                    effort = p.get("effort") or (p.get("collaboration_mode") or {}).get("settings", {}).get("reasoning_effort") or effort
+    except (IndexError, OSError, ValueError):
+        pass
+    return model, effort
+
+
 def dur(sec):
     sec = int(sec)
     return f"{sec // 3600}h{sec % 3600 // 60:02d}m" if sec >= 3600 else f"{sec // 60}m{sec % 60:02d}s"
@@ -107,6 +124,10 @@ def cmd_run(a):
     name = a.name or " ".join(prompt.split()[:6])[:48]
     cwd = os.path.abspath(a.cd or os.getcwd())
     codex = find_codex()
+    if a.resume and not (a.model and a.effort):
+        # `codex exec resume` falls back to config.toml defaults, not the session's own model/effort.
+        model, effort = session_settings(a.resume)
+        a.model, a.effort = a.model or model, a.effort or effort
     common = ["--json", "--skip-git-repo-check", "-c", 'approval_policy="never"']
     if a.model:
         common += ["-m", a.model]
@@ -188,7 +209,10 @@ def cmd_run(a):
     if sid:
         write_run(sid, {"status": status.lower(), "exit_code": code, "ended": time.time()})
 
+    model, effort = session_settings(sid) if sid else (None, None)  # what actually ran
+    model, effort = model or a.model, effort or a.effort
     head = f"[cx] {name} · {status}" + ("" if ok else f" (exit {code})") + f" · {dur(time.time() - t0)}"
+    head += f" · {model or '?'}/{effort or '?'}" if (model or effort) else ""
     head += f" · session {sid}" if sid else ""
     print(head)
     if ok:
@@ -219,7 +243,8 @@ def cmd_ps(a):
         r = s.summary(now, thread_names)
         fails = sum(1 for x in s.recent_exits if x not in (0, None))
         act = (r["last_action"] or {}).get("text", "")
-        print(f"{r['name'][:28]:28} {s.id}  up {dur(now - s.started):>7}  idle {dur(now - s.last_ts):>7}  "
+        me = f"{r['model'] or '?'}/{r['effort'] or '?'}"
+        print(f"{r['name'][:28]:28} {s.id}  {me:18} up {dur(now - s.started):>7}  idle {dur(now - s.last_ts):>7}  "
               f"cmds-failed {fails}/{len(s.recent_exits)}  {r['project']}  | {act[:70]}")
     return 0
 
