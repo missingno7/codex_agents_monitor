@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codex Agents</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='6' fill='%2322a55b'/></svg>">
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #6b7382; --line: #e3e6eb;
+  --hover: #f0f3f8; --sel: #e6eefc; --accent: #2f6fdb;
+  --run: #1f9d55; --idle: #c08a12; --done: #6b7382; --fail: #d0353f;
+  --term-bg: #12151b; --term-text: #d7dce4; --term-muted: #7d8696; --term-line: #232834;
+  --t-prompt: #b99cff; --t-msg: #e8ecf2; --t-final: #6fd39a; --t-exec: #6cb6ff; --t-patch: #f2c46d;
+  --t-tool: #5fd1d1; --t-err: #ff7b82;
+  --mono: ui-monospace, "Cascadia Mono", "Cascadia Code", Consolas, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1216; --panel: #161a20; --text: #dfe3ea; --muted: #8b93a1; --line: #262c35;
+    --hover: #1c2129; --sel: #1d2a40; --accent: #6ea2ff;
+    --run: #3ccf7d; --idle: #e0a93a; --done: #8b93a1; --fail: #ff6b73;
+    --term-bg: #0b0d11; --term-line: #1c212a;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; display: flex; flex-direction: column; }
+button, input, select { font: inherit; color: inherit; }
+header { display: flex; align-items: center; gap: 18px; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+header h1 { font-size: 17px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+.counts { display: flex; gap: 6px; }
+.count { border: 1px solid var(--line); background: transparent; border-radius: 999px; padding: 2px 11px; cursor: pointer; font-size: 13px; color: var(--muted); }
+.count b { font-weight: 700; margin-left: 4px; color: var(--text); }
+.count.running b { color: var(--run); } .count.failed b { color: var(--fail); }
+.count.on { background: var(--sel); border-color: var(--accent); }
+.filters { display: flex; gap: 8px; margin-left: auto; flex-wrap: wrap; }
+.filters select, .filters input { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
+.filters input { width: 220px; }
+main { flex: 1; display: flex; min-height: 0; }
+#list { flex: 1; overflow: auto; min-width: 0; }
+body.has-detail #list { flex: 0 0 380px; border-right: 1px solid var(--line); }
+body.has-detail .wide { display: none; }
+#detail { flex: 1; display: none; flex-direction: column; min-width: 0; background: var(--panel); }
+body.has-detail #detail { display: flex; }
+table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+col.c-st { width: 108px; } col.c-proj { width: 150px; } col.c-rt { width: 86px; } col.c-last { width: 96px; } col.c-now { width: 34%; }
+body.has-detail col.c-proj, body.has-detail col.c-last, body.has-detail col.c-now { width: 0; }
+td { overflow: hidden; }
+th { text-align: left; font-weight: 600; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; padding: 14px 10px 6px; position: sticky; top: 0; background: var(--bg); z-index: 1; }
+th.sec { font-size: 12.5px; color: var(--text); padding-top: 18px; }
+td { padding: 7px 10px; border-top: 1px solid var(--line); vertical-align: top; }
+tr.row { cursor: pointer; }
+tr.row:hover td { background: var(--hover); }
+tr.row.sel td { background: var(--sel); }
+.name { font-weight: 600; }
+.name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sub { color: var(--muted); font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.now { font-family: var(--mono); font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.num { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.dim { color: var(--muted); }
+.tag { font-size: 11px; border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; color: var(--muted); margin-left: 6px; font-weight: 500; }
+.st { white-space: nowrap; font-size: 12px; font-weight: 650; letter-spacing: .3px; }
+.st i { font-style: normal; display: inline-block; width: 14px; text-align: center; margin-right: 4px; }
+.st.running { color: var(--run); } .st.idle { color: var(--idle); } .st.done { color: var(--done); } .st.failed { color: var(--fail); }
+.empty { padding: 40px; color: var(--muted); text-align: center; }
+/* detail */
+.dhead { padding: 12px 18px 10px; border-bottom: 1px solid var(--line); }
+.dtitle { display: flex; align-items: baseline; gap: 12px; }
+.dtitle h2 { margin: 0; font-size: 18px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.close { margin-left: auto; border: 1px solid var(--line); background: transparent; border-radius: 6px; cursor: pointer; padding: 2px 10px; color: var(--muted); }
+.meta { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 3px 22px; margin-top: 8px; font-size: 13px; }
+.meta div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.meta span { color: var(--muted); margin-right: 6px; }
+.meta .full { grid-column: 1 / -1; }
+.mono { font-family: var(--mono); font-size: 12.5px; }
+#termwrap { position: relative; flex: 1; min-height: 0; }
+#term { position: absolute; inset: 0; overflow: auto; background: var(--term-bg); color: var(--term-text); font-family: var(--mono); font-size: 12.5px; line-height: 1.5; padding: 10px 0 30px; }
+.ev { display: grid; grid-template-columns: 64px 64px 1fr; gap: 0 8px; padding: 3px 14px; }
+.ev + .ev { border-top: 1px solid var(--term-line); }
+.ev .ts { color: var(--term-muted); font-size: 11px; padding-top: 1px; }
+.ev .k { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; padding-top: 1px; }
+.ev .b { min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ev pre { margin: 3px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; color: var(--term-muted); }
+.ev pre.bright { color: var(--term-text); }
+.ev pre.clamp { max-height: 19.5em; overflow: hidden; -webkit-mask-image: linear-gradient(#000 80%, transparent); mask-image: linear-gradient(#000 80%, transparent); }
+.ev .more { background: none; border: 0; color: var(--t-exec); cursor: pointer; padding: 0; font: inherit; font-size: 11.5px; }
+.ev details summary { cursor: pointer; color: var(--term-muted); font-size: 11.5px; }
+.k-prompt { color: var(--t-prompt); } .k-message { color: var(--t-msg); } .k-final { color: var(--t-final); }
+.k-exec { color: var(--t-exec); } .k-call { color: var(--term-muted); } .k-patch { color: var(--t-patch); }
+.k-tool { color: var(--t-tool); } .k-error { color: var(--t-err); } .k-thinking, .k-note, .k-turn, .k-done { color: var(--term-muted); }
+.ev.thinking .b, .ev.note .b, .ev.turn .b { color: var(--term-muted); }
+.ev.call .b { color: #aab3c2; }
+.ev.done .b { color: var(--t-final); } .ev.error .b { color: var(--t-err); }
+.ev.final .b { color: #fff; }
+.cmd { color: var(--t-exec); }
+.x0 { color: var(--t-final); } .x1 { color: var(--t-err); }
+#jump { position: absolute; right: 22px; bottom: 16px; display: none; background: var(--accent); color: #fff; border: 0; border-radius: 999px; padding: 6px 14px; cursor: pointer; box-shadow: 0 2px 10px rgba(0,0,0,.35); font-size: 13px; }
+#jump.show { display: block; }
+.live-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--run); margin-right: 6px; animation: pulse 1.6s infinite; }
+@keyframes pulse { 50% { opacity: .3; } }
+@media (max-width: 900px) {
+  body.has-detail #list { display: none; }
+  .filters input { width: 140px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>Codex Agents</h1>
+  <div class="counts">
+    <button class="count running" data-f="running">running<b id="c-running">0</b></button>
+    <button class="count done" data-f="done">finished<b id="c-done">0</b></button>
+    <button class="count failed" data-f="failed">failed<b id="c-failed">0</b></button>
+  </div>
+  <div class="filters">
+    <select id="f-project"><option value="">all projects</option></select>
+    <select id="f-status">
+      <option value="">all statuses</option><option value="running">running</option>
+      <option value="done">finished</option><option value="failed">failed / exited</option>
+    </select>
+    <input id="f-q" type="search" placeholder="search…  ( / )">
+  </div>
+</header>
+<main>
+  <div id="list"><div class="empty">Loading…</div></div>
+  <section id="detail">
+    <div class="dhead" id="dhead"></div>
+    <div id="termwrap"><div id="term"></div><button id="jump">↓ Jump to live</button></div>
+  </section>
+</main>
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+let STATE = null, SEL = null, ES = null, FOLLOW = true, UNSEEN = 0, CLOCK = 0;
+const IDLE_AFTER = 60;
+
+function dur(sec) {
+  if (sec == null || !isFinite(sec)) return "–";
+  sec = Math.max(0, Math.floor(sec));
+  const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
+  if (d) return `${d}d ${h}h`;
+  if (h) return `${h}h ${String(m).padStart(2, "0")}m`;
+  if (m) return `${m}m ${String(s).padStart(2, "0")}s`;
+  return `${s}s`;
+}
+const ago = (t) => t ? dur(now() - t) + " ago" : "–";
+const now = () => STATE ? STATE.now + (Date.now() / 1000 - CLOCK) : Date.now() / 1000;
+const hhmmss = (t) => t ? new Date(t * 1000).toLocaleTimeString([], {hour12: false}) : "";
+const stamp = (t) => t ? new Date(t * 1000).toLocaleString([], {hour12: false}) : "–";
+
+function statusOf(r) {
+  if (r.status === "running") {
+    const idle = now() - (r.last_activity || r.started) > IDLE_AFTER;
+    return idle ? {cls: "idle", icon: "○", text: r.label === "RUNNING" ? "IDLE" : r.label} : {cls: "running", icon: "●", text: r.label};
+  }
+  if (r.status === "done") return {cls: "done", icon: "✓", text: r.label};
+  return {cls: "failed", icon: "×", text: r.label};
+}
+const runtime = (r) => (r.ended || now()) - (r.started || now());
+
+// ---------------------------------------------------------------- list
+function filtered() {
+  const p = $("#f-project").value, st = $("#f-status").value, q = $("#f-q").value.trim().toLowerCase();
+  return STATE.sessions.filter((r) => {
+    if (p && r.project !== p) return false;
+    if (st && r.status !== st) return false;
+    if (q) {
+      const hay = [r.name, r.subtitle, r.project, r.cwd, r.id, r.model, r.branch, r.pid, r.last_action && r.last_action.text].join(" ").toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+}
+
+function rowHtml(r) {
+  const s = statusOf(r);
+  const act = r.last_action ? r.last_action.text : (r.process_only ? "(no session file)" : "");
+  const sub = r.parent_id ? `<span class="tag">sub-agent</span>` : "";
+  return `<tr class="row${r.id === SEL ? " sel" : ""}" data-id="${esc(r.id)}">
+    <td><span class="st ${s.cls}" title="${esc(r.label)}"><i>${s.icon}</i>${esc(s.text)}</span></td>
+    <td><div class="name">${esc(r.name)}${sub}</div>${r.subtitle ? `<div class="sub" title="${esc(r.subtitle)}">${esc(r.subtitle)}</div>` : ""}</td>
+    <td class="wide"><div>${esc(r.project)}</div><div class="sub">${esc(r.branch || "")}</div></td>
+    <td class="num">${dur(runtime(r))}</td>
+    <td class="num wide">${r.status === "running" ? ago(r.last_activity) : (r.ended ? ago(r.ended) : "–")}</td>
+    <td class="wide"><div class="now" title="${esc(act)}">${esc(act)}</div><div class="sub">${esc([r.model, r.effort].filter(Boolean).join(" · "))}</div></td>
+  </tr>`;
+}
+
+function renderList() {
+  const rows = filtered();
+  const running = rows.filter((r) => r.status === "running").sort((a, b) => (a.started || 0) - (b.started || 0) || a.name.localeCompare(b.name));
+  const rest = rows.filter((r) => r.status !== "running").sort((a, b) => (b.ended || 0) - (a.ended || 0));
+  const head = (label, n, second) => `<tr><th class="sec" colspan="2">${label} <span class="dim">(${n})</span></th>
+      <th class="wide">${second ? "" : "Project"}</th><th>${second ? "" : "Runtime"}</th><th class="wide">${second ? "" : "Last activity"}</th><th class="wide">${second ? "" : "Latest step"}</th></tr>`;
+  let html = `<table><colgroup><col class="c-st"><col><col class="c-proj"><col class="c-rt"><col class="c-last"><col class="c-now"></colgroup>`;
+  html += head("Running", running.length, false);
+  html += running.length ? running.map(rowHtml).join("") : `<tr><td colspan="6" class="dim">No running codex exec agents${STATE.ready ? "" : " (scanning…)"}.</td></tr>`;
+  if (rest.length) {
+    html += `<tr><th class="sec" colspan="2">Recently finished <span class="dim">(${rest.length}, last ${STATE.history_hours}h)</span></th><th class="wide">Project</th><th>Runtime</th><th class="wide">Ended</th><th class="wide">Last step</th></tr>`;
+    html += rest.map(rowHtml).join("");
+  }
+  html += "</table>";
+  const list = $("#list"), top = list.scrollTop;
+  list.innerHTML = html;
+  list.scrollTop = top;
+}
+
+function renderCounts() {
+  for (const k of ["running", "done", "failed"]) $("#c-" + k).textContent = STATE.counts[k] || 0;
+  document.title = `Codex Agents (${STATE.counts.running || 0})`;
+  const cur = $("#f-status").value;
+  document.querySelectorAll(".count").forEach((b) => b.classList.toggle("on", b.dataset.f === cur));
+  const sel = $("#f-project"), val = sel.value;
+  const projects = [...new Set(STATE.sessions.map((r) => r.project))].sort();
+  const want = ["", ...projects].join("\n");
+  if (sel.dataset.opts !== want) {
+    sel.innerHTML = `<option value="">all projects</option>` + projects.map((p) => `<option>${esc(p)}</option>`).join("");
+    sel.dataset.opts = want;
+    sel.value = projects.includes(val) ? val : "";
+  }
+}
+
+// ---------------------------------------------------------------- detail
+function launchedBy(r) {
+  if (!r.launched_by || !r.launched_by.length) return "";
+  return r.launched_by.map((a) => `${a.name} (${a.pid})`).join(" ← ");
+}
+
+function renderDetailHead() {
+  const r = STATE && STATE.sessions.find((x) => x.id === SEL);
+  if (!r) { $("#dhead").innerHTML = `<div class="dtitle"><h2 class="dim">Session no longer listed</h2><button class="close" onclick="closeDetail()">✕</button></div>`; return; }
+  const s = statusOf(r);
+  const m = (label, val, cls = "") => val ? `<div class="${cls}" title="${esc(val)}"><span>${label}</span>${esc(val)}</div>` : "";
+  const exit = r.exit_code != null ? String(r.exit_code) : "";
+  $("#dhead").innerHTML = `
+    <div class="dtitle"><span class="st ${s.cls}"><i>${s.icon}</i>${esc(s.text)}</span><h2 title="${esc(r.name)}">${esc(r.name)}</h2>
+      <button class="close" onclick="closeDetail()" title="Close (Esc)">✕</button></div>
+    ${r.subtitle ? `<div class="sub" style="max-width:none" title="${esc(r.subtitle)}">${esc(r.subtitle)}</div>` : ""}
+    <div class="meta">
+      ${m("Project", r.project + (r.branch ? `  (${r.branch})` : ""))}
+      ${m("Runtime", dur(runtime(r)), "num")}
+      ${m(r.status === "running" ? "Last activity" : "Ended", r.status === "running" ? ago(r.last_activity) : stamp(r.ended))}
+      ${m("Started", stamp(r.started))}
+      ${m("PID", r.pid ? String(r.pid) : "")}
+      ${m("Model", [r.model, r.effort].filter(Boolean).join(" · "))}
+      ${m("Tokens", r.tokens ? r.tokens.toLocaleString() : "")}
+      ${m("Exit code", exit)}
+      ${m("Working dir", r.cwd, "full mono")}
+      ${r.error ? m("Error", r.error, "full") : ""}
+      ${m("Session", r.id, "mono")}
+      ${m("Launched by", launchedBy(r), "full")}
+      ${m("Output file", r.out_path, "full mono")}
+    </div>`;
+}
+
+function evHtml(e) {
+  const kind = e.kind === "message" && e.final ? "final" : e.kind;
+  const label = {prompt: "prompt", message: "codex", final: "final", thinking: "thinking", exec: "exec", call: "call",
+                 patch: "patch", tool: "tool", note: "·", turn: "turn", done: "done", error: "error"}[kind] || kind;
+  let body = "";
+  const clampPre = (txt, cls = "") => {
+    if (!txt) return "";
+    const lines = txt.split("\n").length;
+    return lines > 14 || txt.length > 1400
+      ? `<pre class="clamp ${cls}">${esc(txt)}</pre><button class="more" onclick="unclamp(this)">show all (${lines} lines, ${txt.length.toLocaleString()} chars)</button>`
+                      : `<pre class="${cls}">${esc(txt)}</pre>`;
+  };
+  switch (e.kind) {
+    case "prompt": body = clampPre(e.text, "bright"); break;
+    case "thinking": body = esc(e.text || `thinking${e.n > 1 ? ` ×${e.n}` : ""}${e.ms ? ` · ${dur(e.ms / 1000)}` : ""}`); break;
+    case "exec": {
+      const x = e.exit == null ? "" : `<span class="${e.exit === 0 ? "x0" : "x1"}">exit ${esc(e.exit)}</span>`;
+      const meta = [x, e.ms != null ? dur(e.ms / 1000) : ""].filter(Boolean).join(" · ");
+      body = `<span class="cmd">$ ${esc(e.cmd)}</span>${meta ? `  <span class="dim">${meta}</span>` : ""}` + clampPre(e.text);
+      break;
+    }
+    case "call": body = esc(e.text) + (e.code ? `<details><summary>code</summary><pre>${esc(e.code)}</pre></details>` : ""); break;
+    case "patch": body = e.files.map((f) => `<div>${esc({add: "A", update: "M", delete: "D"}[f.type] || f.type)} ${esc(f.path)}</div>` +
+        (f.diff ? `<details><summary>diff</summary><pre>${esc(f.diff)}</pre></details>` : "")).join(""); break;
+    case "tool": body = `${esc(e.name)} <span class="dim">${esc(e.status || "")}${e.ms != null ? " · " + dur(e.ms / 1000) : ""}</span>` +
+        (e.args && e.args !== "{}" ? `<div class="dim">${esc(e.args)}</div>` : "") + (e.text ? `<details><summary>result</summary><pre>${esc(e.text)}</pre></details>` : ""); break;
+    default: body = esc(e.text);
+  }
+  const k = esc(kind);
+  return `<div class="ev ${k}" data-i="${esc(e.i)}"><div class="ts">${hhmmss(e.ts)}</div><div class="k k-${k}">${esc(label)}</div><div class="b">${body}</div></div>`;
+}
+function unclamp(btn) { btn.previousElementSibling.classList.remove("clamp"); btn.remove(); }
+
+function atBottom() { const t = $("#term"); return t.scrollHeight - t.scrollTop - t.clientHeight < 40; }
+function toBottom() { const t = $("#term"); t.scrollTop = t.scrollHeight; FOLLOW = true; UNSEEN = 0; updateJump(); }
+function updateJump() {
+  const j = $("#jump");
+  j.classList.toggle("show", !FOLLOW);
+  j.textContent = UNSEEN ? `↓ Jump to live (${UNSEEN} new)` : "↓ Jump to live";
+}
+
+function openStream(id) {
+  if (ES) { ES.close(); ES = null; }
+  const term = $("#term");
+  term.innerHTML = "";
+  FOLLOW = true; UNSEEN = 0; updateJump();
+  const r = STATE && STATE.sessions.find((x) => x.id === id);
+  if (r && r.process_only) {
+    term.innerHTML = `<div class="ev note"><div class="ts"></div><div class="k k-note">·</div><div class="b">This codex exec process has no session file (for example it runs with --ephemeral), so there is no transcript to show.\n\n${esc(r.cmdline || "")}</div></div>`;
+    return;
+  }
+  ES = new EventSource(`/api/session/${encodeURIComponent(id)}/stream`);
+  ES.addEventListener("events", (msg) => {
+    const evs = JSON.parse(msg.data);
+    const follow = FOLLOW;
+    let added = 0, html = "";
+    for (const e of evs) {
+      if (e.i < term.children.length) {  // re-sent row (merged "thinking" grew); rows are in index order
+        term.children[e.i].outerHTML = evHtml(e); continue;
+      }
+      html += evHtml(e); added++;
+    }
+    if (html) term.insertAdjacentHTML("beforeend", html);
+    if (follow) term.scrollTop = term.scrollHeight;
+    else { UNSEEN += added; updateJump(); }
+  });
+}
+
+function select(id) {
+  if (SEL === id) return;
+  SEL = id;
+  document.body.classList.toggle("has-detail", !!id);
+  if (id) { renderDetailHead(); openStream(id); } else if (ES) { ES.close(); ES = null; }
+  if (STATE) renderList();
+  const h = id ? "#/" + encodeURIComponent(id) : "#";
+  if (location.hash !== h) history.replaceState(null, "", h);
+}
+function closeDetail() { select(null); }
+
+// ---------------------------------------------------------------- polling
+async function poll() {
+  try {
+    const res = await fetch("/api/state", {cache: "no-store"});
+    STATE = await res.json();
+    CLOCK = Date.now() / 1000;
+    renderCounts(); renderList();
+    if (SEL) renderDetailHead();
+  } catch (e) {
+    $("#list").innerHTML = `<div class="empty">Dashboard server not reachable – is <code>codex-dashboard</code> running?</div>`;
+  }
+  setTimeout(poll, 1500);
+}
+
+$("#list").addEventListener("click", (ev) => { const tr = ev.target.closest("tr.row"); if (tr) select(tr.dataset.id); });
+for (const id of ["#f-project", "#f-status"]) $(id).addEventListener("change", () => { renderCounts(); renderList(); });
+$("#f-q").addEventListener("input", renderList);
+document.querySelectorAll(".count").forEach((b) => b.addEventListener("click", () => {
+  const s = $("#f-status"); s.value = s.value === b.dataset.f ? "" : b.dataset.f; renderCounts(); renderList();
+}));
+$("#term").addEventListener("scroll", () => { const b = atBottom(); if (b !== FOLLOW) { FOLLOW = b; if (b) UNSEEN = 0; updateJump(); } });
+$("#jump").addEventListener("click", toBottom);
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && SEL && document.activeElement !== $("#f-q")) closeDetail();
+  if (e.key === "/" && document.activeElement.tagName !== "INPUT") { e.preventDefault(); $("#f-q").focus(); }
+});
+window.addEventListener("hashchange", () => { const id = decodeURIComponent(location.hash.replace(/^#\/?/, "")); select(id || null); });
+
+(async () => {
+  await poll.call(null);
+  const id = decodeURIComponent(location.hash.replace(/^#\/?/, ""));
+  if (id) select(id);
+})();
+</script>
+</body>
+</html>
