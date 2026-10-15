@@ -4,17 +4,20 @@
     cx run [-n NAME] [-C DIR] [-m MODEL] [-e EFFORT] [-s SANDBOX] [--resume SESSION] [PROMPT | < prompt]
     cx ps
 
-`cx run` blocks until the worker finishes and prints only a one-line header plus the worker's final
-answer (or the actual error).  Launch it as a background task and the completion notification *is*
-the "worker finished" event; the transcript stays in Codex's own session file (and the dashboard).
-Exit code: 0 done, 1 failed.  `cx ps` prints one health line per running `codex exec` worker.
+`cx run` blocks until the worker finishes.  It prints a `started · session ID` line as soon as Codex has
+a session, then a one-line header plus the worker's final answer (or the actual error).  Launch it as a
+background task and the completion notification *is* the "worker finished" event; the transcript stays
+in Codex's own session file (and the dashboard).  `--resume` keeps the session's directory, model and
+effort.  Exit code: 0 done, 1 failed.  `cx ps` prints one health line per running `codex exec` worker.
 """
 import argparse
 import collections
 import glob
 import json
 import os
+import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -22,7 +25,8 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNS_DIR = os.path.join(os.path.expanduser("~"), ".codex-dashboard", "runs")
-EXIT_GRACE = 60  # seconds codex may linger after reporting its turn finished before cx stops it
+EXIT_GRACE = 20  # seconds codex may linger after reporting its turn finished before cx stops it
+                 # (a normal exit takes <1 s; under load Codex failed to exit in ~2 of 3 runs, 2026-09-25)
 
 
 def find_codex():
@@ -71,20 +75,39 @@ def bind_to_our_lifetime(proc):
 
 
 def session_settings(sid):
-    """(model, effort) of a session's latest turn, from its Codex rollout; (None, None) if unknown."""
+    """(model, effort, cwd) of a session's latest turn; None for anything unknown.
+
+    Codex's own thread index (state_N.sqlite) covers every session, including old ones whose rollout has been
+    compressed to .jsonl.zst; the plain rollout is the fallback if the index's name or schema changes."""
     home = os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
-    paths = glob.glob(os.path.join(home, "sessions", "*", "*", "*", f"rollout-*-{sid}.jsonl"))
-    model = effort = None
+    model = effort = cwd = None
+    dbs = sorted(glob.glob(os.path.join(home, "state_*.sqlite")),
+                 key=lambda p: int(re.sub(r"\D", "", os.path.basename(p)) or 0))
     try:
-        with open(paths[0], "rb") as f:
-            for line in f:
-                if b'"turn_context"' in line[:120]:
-                    p = json.loads(line).get("payload") or {}
-                    model = p.get("model") or model
-                    effort = p.get("effort") or (p.get("collaboration_mode") or {}).get("settings", {}).get("reasoning_effort") or effort
-    except (IndexError, OSError, ValueError):
+        con = sqlite3.connect(f"file:{dbs[-1]}?mode=ro", uri=True, timeout=5)
+        try:
+            row = con.execute("SELECT model, reasoning_effort, cwd FROM threads WHERE id = ?", (sid,)).fetchone()
+        finally:
+            con.close()
+        if row:
+            model, effort, cwd = row
+    except (IndexError, sqlite3.Error):
         pass
-    return model, effort
+    if not (model and cwd):
+        paths = glob.glob(os.path.join(home, "sessions", "*", "*", "*", f"rollout-*-{sid}.jsonl"))
+        try:
+            with open(paths[0], "rb") as f:
+                for line in f:
+                    if b'"turn_context"' in line[:120]:
+                        p = json.loads(line).get("payload") or {}
+                        model = p.get("model") or model
+                        effort = p.get("effort") or (p.get("collaboration_mode") or {}).get("settings", {}).get("reasoning_effort") or effort
+                        cwd = p.get("cwd") or cwd
+        except (IndexError, OSError, ValueError):
+            pass
+    if cwd and cwd.startswith("\\\\?\\"):
+        cwd = cwd[4:]
+    return model, effort, cwd
 
 
 def dur(sec):
@@ -93,7 +116,8 @@ def dur(sec):
 
 
 def write_run(sid, data):
-    """Tell the human dashboard the name/outcome of a managed worker (best effort, never fatal)."""
+    """Record which session a `-n` name belongs to (dashboard label; name -> session lookup).  Written once:
+    the outcome lives in Codex's own rollout, so there is nothing here that can go stale."""
     try:
         os.makedirs(RUNS_DIR, exist_ok=True)
         path = os.path.join(RUNS_DIR, sid + ".json")
@@ -125,10 +149,13 @@ def cmd_run(a):
     name = a.name or " ".join(prompt.split()[:6])[:48]
     cwd = os.path.abspath(a.cd or os.getcwd())
     codex = find_codex()
-    if a.resume and not (a.model and a.effort):
-        # `codex exec resume` falls back to config.toml defaults, not the session's own model/effort.
-        model, effort = session_settings(a.resume)
+    if a.resume:
+        # `codex exec resume` falls back to config.toml defaults, not the session's own model/effort, and it
+        # runs (and moves the sandbox's writable root) wherever it is started.  Keep all three unless overridden.
+        model, effort, session_cwd = session_settings(a.resume)
         a.model, a.effort = a.model or model, a.effort or effort
+        if not a.cd and session_cwd:
+            cwd = session_cwd
     common = ["--json", "--skip-git-repo-check", "-c", 'approval_policy="never"']
     if a.model:
         common += ["-m", a.model]
@@ -169,7 +196,7 @@ def cmd_run(a):
     err_thread.start()
     threading.Thread(target=feed_stdin, daemon=True).start()
 
-    st = {"sid": a.resume, "final": None, "errors": [], "failed": False, "turn_done": None}
+    st = {"sid": a.resume, "final": None, "errors": [], "failed": False, "turn_done": None, "cmds": 0, "cmds_ok": 0}
 
     def read_events():
         for raw in proc.stdout:
@@ -178,13 +205,20 @@ def cmd_run(a):
             except ValueError:
                 continue
             t = ev.get("type")
+            item = ev.get("item") or {}
             if t == "thread.started":
                 st["sid"] = ev.get("thread_id")
-                write_run(st["sid"], {"name": name, "cwd": cwd, "started": t0, "pid": proc.pid, "status": "running"})
+                write_run(st["sid"], {"name": name, "cwd": cwd, "started": t0})
+                # First line of output, so the session survives TaskStop, a crash or a lost notification.
+                me = f" · {a.model or 'default'}/{a.effort or 'default'}" if (a.model or a.effort) else ""
+                print(f"[cx] {name} · started{me} · session {st['sid']}", flush=True)
+            elif t == "item.started" and item.get("type") == "command_execution":
+                st["cmds"] += 1
             elif t == "item.completed":
-                item = ev.get("item") or {}
                 if item.get("type") == "agent_message":
                     st["final"] = item.get("text")
+                elif item.get("type") == "command_execution" and item.get("exit_code") == 0:
+                    st["cmds_ok"] += 1
             elif t == "turn.failed":
                 st["failed"] = True
                 st["turn_done"] = time.time()
@@ -220,21 +254,33 @@ def cmd_run(a):
             time.sleep(0.05)
     ok = (code == 0 or stuck) and not failed  # stuck implies the turn had already finished
     status = "DONE" if ok else "FAILED"
-    if sid:
-        write_run(sid, {"status": status.lower(), "exit_code": code, "ended": time.time()})
 
-    model, effort = session_settings(sid) if sid else (None, None)  # what actually ran
+    model, effort, ran_in = session_settings(sid) if sid else (None, None, None)  # what actually ran
     model, effort = model or a.model, effort or a.effort
     head = f"[cx] {name} · {status}" + ("" if ok else f" (exit {code})") + f" · {dur(time.time() - t0)}"
     head += f" · {model or '?'}/{effort or '?'}" if (model or effort) else ""
     head += f" · session {sid}" if sid else ""
+    if ran_in and os.path.normcase(os.path.normpath(ran_in)) != os.path.normcase(cwd):
+        head += f" · ran in {ran_in}"  # e.g. a Codex-managed worktree (`-- --worktree`)
+    # A worker can report DONE although its shell never worked (sandbox stalls, a resume whose sandbox
+    # failed to start); the commands it tried are the cheap tell.
+    if st["cmds"] and not st["cmds_ok"]:
+        head += f" · 0 of {st['cmds']} commands succeeded"
     head += f" · (codex did not exit {EXIT_GRACE}s after finishing; stopped it)" if stuck else ""
     print(head)
     if ok:
         print(final if final is not None else "(worker finished without a final message)")
     else:
-        for e in dict.fromkeys(errors):
-            print("error:", e)
+        # Codex reports every reconnect attempt as an error; during an outage that is ~10 long lines per
+        # worker.  Keep the final errors, count the retries.
+        retries = [e for e in errors if e.startswith("Reconnecting...")]
+        final_errors = [e for e in errors if not e.startswith("Reconnecting...")] or retries[-1:]
+        for e in list(dict.fromkeys(final_errors))[-3:]:
+            print("error:", e if len(e) <= 400 else e[:400] + " …")
+        if retries:
+            print(f"(after {len(retries)} reconnect attempts; last: {retries[-1][:160]})")
+        if not st["turn_done"]:
+            print(f"error: codex exited (code {code}) before finishing its turn")
         if not errors:
             print("\n".join(l for l in err_lines if l) or "(no error output)")
         if final:
