@@ -20,19 +20,24 @@ transcript never reaches you; the human watches it in the dashboard.
 
 ## When to delegate
 
-Delegate independent, bounded units: investigating a function or module, implementing a change confined to
-known files, running and analysing an experiment, reviewing a diff. Keep design decisions, acceptance and
-writes to shared or canonical files for yourself, or give them to exactly one worker at a time.
+Delegate meaningful, well-scoped objectives, not single steps: investigating a function or module,
+implementing a change confined to known files, running and analysing a line of experiments, reviewing a diff.
+Keep design decisions, acceptance and writes to shared or canonical files for yourself, or give them to exactly
+one worker at a time.
 
 ## Brief
 
-Each worker starts from zero: give it everything it needs in the prompt.
+Each worker starts from zero: give it everything it needs in the prompt. Codex already loads the project's
+`AGENTS.md` for `-C`, so don't tell the worker to read it; point only to the other docs that matter for this task.
 - Goal, and the files or area to work in (absolute paths).
 - Constraints: what it must not touch, and which commands it may run.
-- What "done" looks like, plus a stop rule: "if blocked, stop and report the exact evidence; don't guess".
+- What "done" looks like. The worker should work autonomously: try, verify and adapt on its own, and keep going
+  while it has productive directions. It returns at a natural decision point: the objective is done, a genuine
+  blocker, directions exhausted, or a finding that needs broader coordination. It runs non-interactively, so it
+  must never wait for input or approval; a decision it can't make is reported as a blocker.
 - Where bulky output goes (a path the project owns) and the final-answer contract. The first line must be
-  `STATUS: done | partial | blocked | failed`, followed by ≤15 lines: what changed, evidence (command → result),
-  open questions.
+  `STATUS: done | partial | blocked | failed`, followed by ≤15 lines: outcome and meaningful progress,
+  verification evidence (command → result), blockers, suggested next step.
 
 Write the prompt to a file and redirect it (`< PROMPT.md`), or use a heredoc for short prompts. Don't
 assemble prompts with `{ cat a; cat b; } | cx`: a wrong path silently truncates the prompt.
@@ -56,6 +61,8 @@ python ~/.codex-dashboard/cx.py run -n NAME -C D:/abs/repo -m MODEL -e EFFORT < 
   have no time limit in an interactive session. (Headless `-p`/SDK runs do: 30 min default, raised with
   `BASH_DEFAULT_TIMEOUT_MS`/`BASH_MAX_TIMEOUT_MS`.)
 - Launch from your own session, not from inside a subagent: a subagent's background shells are reaped when it ends.
+- After changing tooling or the environment, run one representative worker first and confirm its commands work
+  before launching the fleet.
 - Invoke exactly as `python …/cx.py`, never through a shell wrapper, or cancel won't reach Codex.
 - Options: `-n NAME`, `-C DIR` (default: current dir), `-m`, `-e` (low/medium/high/xhigh), `-s SANDBOX`, and extra
   `codex exec` arguments after `--` (e.g. `-- --worktree`).
@@ -64,6 +71,9 @@ python ~/.codex-dashboard/cx.py run -n NAME -C D:/abs/repo -m MODEL -e EFFORT < 
 
 **Do other work, or end your turn. Never poll:** no sleep loops, no grepping output files, no `tail`. The
 completion notification arrives by itself, naming the task. Then read its output file **once**.
+Each of your turns re-reads your whole context, so turns are the real cost of supervision: handle workers that
+finish together in one turn, read reports and artifacts with bounded commands (`head`, `rg`), and don't re-read
+what you have already summarised.
 `cx ps` (one line per running worker: model/effort, uptime, idle time, failed commands, last step) is only for
 when something looks wrong, e.g. a worker taking far longer than its peers.
 
@@ -91,13 +101,18 @@ when something looks wrong, e.g. a worker taking far longer than its peers.
   output files). If a resume fails at sandbox start, use a fresh worker.
 - **Cancel:** TaskStop the background task; it kills the Codex process tree. **Redirect:** TaskStop, then
   `--resume` the session id from the `started` line with the correction.
-- **Time box:** state it in the brief; if a worker overruns, TaskStop it and resume or replace it.
+- **Stagnation:** a worker that runs far longer than its peers (`cx ps`), keeps compacting its context, or
+  repeats unsuccessful experiments is usually past productive work. Reassess it: redirect, replace it with a fresh
+  worker that starts from its report, or stop the line of work. Don't let it grind on.
 
 ## Failures
 
 - Many workers failing at once with `websocket closed` / `401 Unauthorized` / usage-limit errors is a backend
   outage or exhausted quota. Stop launching, don't relaunch in a loop, and `--resume` the affected sessions later
   (or switch model family if the user agrees).
+- Several workers reporting the same underlying blocker: stop launching similar work, resolve it centrally (or
+  have one worker investigate it), then resume the blocked workers with the fix. A read-only worker that reads a
+  batch of finished reports is a cheap way to spot such blockers.
 - `flagged for possible cybersecurity risk`: rephrase the task neutrally or use another model. `model is at
   capacity`: use another model or retry later.
 - If a result looks like the worker never got its mission, check the prompt file: cx can't tell a malformed prompt
