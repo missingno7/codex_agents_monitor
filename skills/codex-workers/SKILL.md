@@ -77,8 +77,9 @@ when something looks wrong, e.g. a worker taking far longer than its peers.
   one: `-- --worktree` (the header shows where it ran). Shared or canonical files get a single writer.
 - Workers must not leave background processes running. Say so in the brief when they start servers or long
   scripts.
-- If even trivial commands stall in the sandbox (e.g. `echo` takes minutes), stop launching, run one small probe,
-  and ask the user how to proceed.
+- The sandbox adds a few seconds to every command, more with many workers (measured: ~1.4 s alone, ~4.6 s at 18
+  concurrent workers). That's expected, not a reason to drop the sandbox. If even trivial commands take *minutes*
+  (e.g. `echo`), stop launching, run one small probe, and ask the user how to proceed.
 
 ## Results, continuation, cancellation
 

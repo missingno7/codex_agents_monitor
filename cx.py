@@ -45,33 +45,41 @@ def find_codex():
 
 
 def bind_to_our_lifetime(proc):
-    """Windows: put the worker in a kill-on-close job, so if cx is killed (TaskStop), Codex dies too."""
-    if os.name != "nt":
-        return
-    try:
-        import ctypes
-        from ctypes import wintypes as wt
-        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        k32.CreateJobObjectW.restype = wt.HANDLE
-        k32.OpenProcess.restype = wt.HANDLE
+    """Windows: put Codex in a kill-on-close job.  Everything it starts inherits the job, so when cx ends for
+    any reason (normal exit, TaskStop, crash) all of it ends too.  Returns None, or why that failed.
 
-        class LIMIT(ctypes.Structure):  # JOBOBJECT_EXTENDED_LIMIT_INFORMATION
-            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
-                        ("LimitFlags", wt.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
-                        ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wt.DWORD),
-                        ("Affinity", ctypes.c_size_t), ("PriorityClass", wt.DWORD), ("SchedulingClass", wt.DWORD),
-                        ("IoCounters", ctypes.c_uint64 * 6), ("ProcessMemoryLimit", ctypes.c_size_t),
-                        ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t),
-                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
-        job = k32.CreateJobObjectW(None, None)
-        info = LIMIT(LimitFlags=0x2000)  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        k32.SetInformationJobObject(wt.HANDLE(job), 9, ctypes.byref(info), ctypes.sizeof(info))
-        h = k32.OpenProcess(0x0101, False, proc.pid)  # PROCESS_SET_QUOTA | PROCESS_TERMINATE
-        k32.AssignProcessToJobObject(wt.HANDLE(job), wt.HANDLE(h))
-        k32.CloseHandle(wt.HANDLE(h))
-        bind_to_our_lifetime.job = job  # keep the handle open for our whole lifetime
-    except Exception:
-        pass
+    Codex itself is assigned, not cx: when cx runs on the Microsoft Store Python (a packaged app), children of
+    a job-assigned cx are created outside that job (verified 2026-10-15), while an explicitly assigned Codex
+    and its descendants stay in it.  Codex is assigned microseconds after it starts, long before it can
+    start anything of its own."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes as wt
+
+    class LIMIT(ctypes.Structure):  # JOBOBJECT_EXTENDED_LIMIT_INFORMATION (144 bytes on x64)
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wt.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wt.DWORD),
+                    ("Affinity", ctypes.c_size_t), ("PriorityClass", wt.DWORD), ("SchedulingClass", wt.DWORD),
+                    ("IoCounters", ctypes.c_uint64 * 6), ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateJobObjectW.argtypes, k32.CreateJobObjectW.restype = [ctypes.c_void_p, wt.LPCWSTR], wt.HANDLE
+    k32.SetInformationJobObject.argtypes = [wt.HANDLE, ctypes.c_int, ctypes.c_void_p, wt.DWORD]
+    k32.AssignProcessToJobObject.argtypes = [wt.HANDLE, wt.HANDLE]
+    job = k32.CreateJobObjectW(None, None)
+    if not job:
+        return f"CreateJobObject failed (error {ctypes.get_last_error()})"
+    info = LIMIT(LimitFlags=0x2000)  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if not k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
+        return f"SetInformationJobObject failed (error {ctypes.get_last_error()})"
+    if not k32.AssignProcessToJobObject(job, int(proc._handle)):  # Popen's own handle has the needed rights
+        return f"AssignProcessToJobObject failed (error {ctypes.get_last_error()})"
+    bind_to_our_lifetime.job = job  # never closed: the OS closes it when cx exits, which kills the job
+    return None
 
 
 def session_settings(sid):
@@ -116,18 +124,14 @@ def dur(sec):
 
 
 def write_run(sid, data):
-    """Record which session a `-n` name belongs to (dashboard label; name -> session lookup).  Written once:
-    the outcome lives in Codex's own rollout, so there is nothing here that can go stale."""
+    """Label a session with its latest cx invocation ({name, cwd, started}): the dashboard's display name, and a
+    name -> session lookup.  A resume replaces the record (resumes are usually named NAME-2, NAME-3); outcomes
+    live in Codex's own rollout, so nothing here can go stale.  Best effort, never fatal."""
     try:
         os.makedirs(RUNS_DIR, exist_ok=True)
         path = os.path.join(RUNS_DIR, sid + ".json")
-        old = {}
-        if os.path.exists(path):
-            with open(path, encoding="utf-8") as f:
-                old = json.load(f)
-        old.update(data)
         with open(path + ".tmp", "w", encoding="utf-8") as f:
-            json.dump(old, f)
+            json.dump(data, f)
         os.replace(path + ".tmp", path)
     except Exception:
         pass
@@ -178,7 +182,12 @@ def cmd_run(a):
     except OSError as e:
         print(f"[cx] {name} · FAILED · not started\nerror: cannot run {codex}: {e.strerror or e}")
         return 1
-    bind_to_our_lifetime(proc)
+    try:
+        uncontained = bind_to_our_lifetime(proc)
+    except Exception as e:  # e.g. ctypes unavailable
+        uncontained = repr(e)
+    if uncontained:
+        print(f"note: {uncontained}; processes this worker starts may outlive it or a TaskStop", flush=True)
     stderr_tail = collections.deque(maxlen=15)
 
     def drain_stderr():
@@ -196,7 +205,8 @@ def cmd_run(a):
     err_thread.start()
     threading.Thread(target=feed_stdin, daemon=True).start()
 
-    st = {"sid": a.resume, "final": None, "errors": [], "failed": False, "turn_done": None, "cmds": 0, "cmds_ok": 0}
+    st = {"sid": a.resume, "final": None, "errors": [], "failed": False, "completed": False, "turn_done": None,
+          "cmds": 0, "cmds_ok": 0}
 
     def read_events():
         for raw in proc.stdout:
@@ -204,8 +214,10 @@ def cmd_run(a):
                 ev = json.loads(raw)
             except ValueError:
                 continue
+            if not isinstance(ev, dict):  # anything unexpected must not kill this reader and lose later events
+                continue
             t = ev.get("type")
-            item = ev.get("item") or {}
+            item = ev.get("item") if isinstance(ev.get("item"), dict) else {}
             if t == "thread.started":
                 st["sid"] = ev.get("thread_id")
                 write_run(st["sid"], {"name": name, "cwd": cwd, "started": t0})
@@ -224,6 +236,7 @@ def cmd_run(a):
                 st["turn_done"] = time.time()
                 st["errors"].append(error_text(ev.get("error")))
             elif t == "turn.completed":
+                st["completed"] = True
                 st["turn_done"] = time.time()
             elif t == "error":
                 st["errors"].append(error_text(ev))
@@ -252,7 +265,11 @@ def cmd_run(a):
             break
         except RuntimeError:  # still being appended to
             time.sleep(0.05)
-    ok = (code == 0 or stuck) and not failed  # stuck implies the turn had already finished
+    # DONE means Codex reported its turn completed.  A clean process exit alone is not enough (a truncated
+    # event stream must not look like success), and a non-zero exit after a completed turn (e.g. the watchdog
+    # stopping a Codex that hung on the way out) does not undo the work.  Whether the work is any good is
+    # for the supervisor to judge.
+    ok = st["completed"] and not failed
     status = "DONE" if ok else "FAILED"
 
     model, effort, ran_in = session_settings(sid) if sid else (None, None, None)  # what actually ran
@@ -266,7 +283,10 @@ def cmd_run(a):
     # failed to start); the commands it tried are the cheap tell.
     if st["cmds"] and not st["cmds_ok"]:
         head += f" · 0 of {st['cmds']} commands succeeded"
-    head += f" · (codex did not exit {EXIT_GRACE}s after finishing; stopped it)" if stuck else ""
+    if stuck:
+        head += f" · (codex did not exit {EXIT_GRACE}s after finishing; stopped it)"
+    elif ok and code != 0:
+        head += f" · (codex exited {code} after finishing)"
     print(head)
     if ok:
         print(final if final is not None else "(worker finished without a final message)")

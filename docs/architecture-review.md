@@ -1,5 +1,10 @@
 # Claude Code ↔ Codex worker integration — architecture review
 
+> **Historical record, not the current specification.** It captures the evidence and reasoning of 2026-10-15
+> (state of the code *before* the changes it proposed). Current behaviour is described by `README.md`, the
+> skill (`skills/codex-workers/SKILL.md`) and the tests (`tests/`); where they differ from this document,
+> they win. The README's "Design decisions" section summarises which conclusions are still in force.
+
 Date: 2026-10-15 · Scope: `codex_agents_monitor` (cx.py, the `codex-workers` skill, install.ps1, dashboard) and how
 it is used in practice. simant_recon, simantw_recon, stunts_recon and empires_reconstruction were read only as case
 studies. No code was changed.
@@ -34,8 +39,10 @@ So this is **not a rewrite**. The real friction in 1,678 production workers come
    - Workers were told to "work in a worktree" while `-C` pointed at the main repo.
    → **Rewrite the skill around delegation, put it in the repo, and install it** (no code).
 5. **The Windows sandbox.** In September, supervisors abandoned it under load (52% of workers ran
-   `danger-full-access`), and that is what made the process-escape incidents possible. Today, 16 concurrent sandboxed
-   workers ran fine (E10). → **Re-test under sustained load before choosing to run unsandboxed** (experiment).
+   `danger-full-access`), and that is what made the process-escape incidents possible. Re-tested (E11): 18
+   concurrent sandboxed workers ran 541 commands with no stall; the sandbox adds ~4.6 s per command at that load
+   (~1.4 s alone). → **Sandboxed fleets are viable again; going unsandboxed is now a speed/safety trade-off for the
+   user to make, not a necessity.**
 
 ---
 
@@ -105,7 +112,8 @@ total. The probe script and raw outputs are in the session scratchpad (`exp/`).
 | E7 | `codex exec --worktree` (via `cx … -- --worktree`) | Creates `~/.codex/worktrees/<id>/<repo>`, detached HEAD; `session_meta.cwd` records it. Git in the sandbox fails with "dubious ownership" — as it does for a plain sandboxed worker in a fresh repo, so it's `safe.directory` setup for the sandbox user, not a worktree issue |
 | E8 | Input tokens of a trivial turn with user config vs `--ignore-user-config` | 16,476 vs 13,745–14,933: plugins/MCP/notify add ~1.5–2.7k tokens per request, mostly cached |
 | E9 | Worker asked to report a failed command's output | It replied "STARTED" anyway. **Final answers are claims** |
-| E10 | 16 concurrent workspace-write workers, each running a command | **16/16 correct**; first command 8–12 s after launch (single worker ~8 s). No starvation in a burst; a sustained hour-long load was not tested |
+| E10 | 16 concurrent workspace-write workers, each running a command | **16/16 correct**; first command 8–12 s after launch (single worker ~8 s). No starvation in a burst |
+| E11 | X2: 18 concurrent workers × 30 separate commands each, workspace-write vs danger-full-access, plus 1-worker baselines (~3.5 min of sustained load per run) | 1,085 commands, 0 failures, no stall in either mode. Median gap between a worker's commands: unsandboxed 1.32 s alone / 1.40 s at 18 (the model turn barely slows); sandboxed 2.72 s alone / **6.03 s at 18**. So the elevated sandbox costs ~1.4 s per command alone and **~4.6 s per command at 18 concurrent workers**: it grows with load but is a tax, not September's minutes-long stall. Commands were trivial; 30+ workers and hour-long runs remain untested |
 
 E5 — does a detached helper outlive its worker?
 
@@ -156,7 +164,7 @@ Fix owner: **1** cx, **2** skill wording, **3** project (out of scope).
 | W5 | Workers killed by the supervisor's own `timeout` | S2: 6 workers killed at exactly 2:00:00, status `killed`, no header; partial work salvaged by hand from worktrees. The launches carried `timeout: 7200000` (simant 83, blood2 43). Docs: in the desktop app/terminal a background command has no time limit unless Claude passes `timeout`; 2 h is that parameter's maximum | B → 2 |
 | W6 | Poll loops and detached launches despite the skill | S2: 118 `grep [cx] … ; sleep 10` loops, 13.2 h blocked, 39 min after loading the skill. Stunts: after compaction, `for n …; do (cx … &); done` + 34 `until grep` watchers; S0/S4 then needed `taskkill`, and an orphan watcher kept polling. The stunts skill was only `cat`'d, never invoked through the Skill tool, so it was not re-attached after compaction | B → 2 |
 | W7 | Isolation advice missing | S2 phase 2: workers told to "work in build/workers/NAME/wt" while `-C` was the main repo, so the sandbox allowed main-checkout writes; p2-vga amended a main-repo commit, then cherry-pick and patch conflicts. S2 11:28: a read-only worker given a writing task | B → 2 |
-| W8 | Sandbox stalls under load | S1 09-29: `echo hi` pending >2 min, 9 workers stopped twice, Codex abandoned for Claude subagents. simantw 09-25: per-command `setup refresh`, read-only probe 5m01s vs full-access 11 s, so the fleet went unsandboxed. The lesson stayed in one project's memory. E10 today: not reproduced in a burst of 16 | Codex platform → 2 + experiment |
+| W8 | Sandbox stalls under load | S1 09-29: `echo hi` pending >2 min, 9 workers stopped twice, Codex abandoned for Claude subagents. simantw 09-25: per-command `setup refresh`, read-only probe 5m01s vs full-access 11 s, so the fleet went unsandboxed. The lesson stayed in one project's memory. Not reproduced today (E10, E11): at 18 concurrent workers the sandbox costs ~4.6 s per command, no stalls | Codex platform (apparently fixed) → 2 |
 | W9 | Skill unversioned and wrapper-centric | Lives only in `~/.claude/skills`; install.ps1 doesn't install it; supervisors patched the installed cx.py in place (twice) | A → 1 + 2 |
 | W10 | Exit hang (Codex bug) | 31–33 real runs needed the watchdog (09-25…09-30, once 10-07); 0 in 14 runs today | Codex → 1, already handled |
 
@@ -326,7 +334,7 @@ mention that in one line.
 | Idea | Gain | Needs proof of | Experiment |
 |---|---|---|---|
 | X1. `--worktree` as the default for writing workers | No main-checkout writes; no clobbering | Git works in `~/.codex/worktrees` for the sandbox user (`safe.directory`); cleanup of that directory; merge cost for the supervisor | 3 writers on one repo; record merge steps and leftover worktrees |
-| X2. Sandboxed fleets at scale | Removes the need for danger-full-access, and with it the escape risk | That W8 is gone in current Codex under *sustained* load | 15–20 sandboxed workers × 30 min of real commands; per-command latency from rollouts (`item_completed` timings) |
+| X2. Sandboxed fleets at scale | Removes the need for danger-full-access, and with it the escape risk | **Done (E11):** no stall at 18 concurrent workers; ~4.6 s sandbox overhead per command. Still open: 30+ workers, hour-long real workloads | Watch for the header's `0 of N commands succeeded` and slow `cx ps` idle times in the next real campaign |
 | X3. Worker config profile (`-c notify=[] -c mcp_servers.node_repl.enabled=false`, or `-p worker`) | ~10–15% fewer input tokens per request; no Desktop `notify` per turn | That workers don't need those tools; any effect on hangs or stalls | A/B 20 real tasks |
 | X4. app-server runtime | Graceful interrupt, mid-turn steering | That mid-flight redirect is needed often enough to beat TaskStop + resume (0 such cases in the transcripts) | Don't start until the evidence exists |
 | X5. `cx run --timeout DUR` | Prompt time boxes become real; the id and a partial answer survive | That time boxes in the brief + TaskStop aren't enough (stunts: two user complaints about 3 h+ workers) | Add only if overruns recur |

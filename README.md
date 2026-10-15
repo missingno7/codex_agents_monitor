@@ -41,16 +41,40 @@ hash), skips the git-repo check, disables approvals, blocks until the worker end
 (exit 0/1). The header flags workers whose commands all failed (`0 of N commands succeeded`) and shows
 `ran in DIR` when Codex worked elsewhere (e.g. `-- --worktree`).
 
+What the outcome means — three separate things, deliberately not merged:
+* **DONE / FAILED** is Codex's own verdict on its turn: DONE only if it reported `turn.completed` (and no
+  `turn.failed`). A process that exits 0 without that is FAILED; a Codex that hangs after completing its
+  turn is stopped after 20 s and still DONE.
+* **`0 of N commands succeeded`** says the worker's shell never worked, whatever the turn reported.
+* **Whether the work is right** is for the supervisor to check; cx does not judge task results.
+
 Run it as a Claude Code background task: the completion notification is the "worker finished" event,
 and TaskStop cancels it (invoke via `python …`, not a shell wrapper, or cancel does not reach Codex).
-Codex is bound to cx by a kill-on-close job object, so processes the worker starts end with it.
+Codex is bound to cx by a kill-on-close job object, so processes the worker starts end with it (if that
+setup fails, cx says so in a `note:` line).
 `--resume` continues a worker with its context (`codex exec resume`) in the session's own directory and
 with its own model/effort (read from Codex's thread index, `~/.codex/state_*.sqlite`); `-C/-m/-e`
-override them. cx writes `~/.codex-dashboard/runs/<session>.json` once (name, cwd, start) so the dashboard
-labels managed workers. `cx ps` prints one health line per running worker.
+override them. cx writes `~/.codex-dashboard/runs/<session>.json` (`{name, cwd, started}` of the latest cx
+invocation of that session; a resume replaces it) so the dashboard labels managed workers. `cx ps` prints one
+health line per running worker.
 
 Agent-facing instructions live in the `codex-workers` skill: `skills/codex-workers/SKILL.md`, installed to
 `~/.claude/skills/codex-workers/` by `install.ps1`. Re-run `install.ps1` after editing either.
+
+Tests: `python -m unittest discover tests` (Windows; a fake Codex replays scripted event streams, no model
+calls, ~20 s). Two tests need a non-Store Python for the fake (`CX_TEST_PYTHON`) and are skipped without one.
+
+### Design decisions (current; evidence in `docs/architecture-review.md`)
+
+* **One blocking `codex exec --json` per worker, run as a Claude Code background task.** The harness
+  notification is the completion event, TaskStop is cancel, `codex exec resume` is continuation. No daemon,
+  job list, wait/poll command, MCP server or app-server client: they would duplicate what Claude Code and
+  Codex already provide.
+* **Containment is the job object only.** cx does not hunt processes by parent PID; an earlier version that
+  did killed unrelated applications. Codex itself is assigned to the job, not cx (see `bind_to_our_lifetime`).
+* **cx keeps no state of its own** beyond the per-session label; Codex's rollouts and thread index are the
+  source of truth.
+* **Project concerns stay in projects** (task decomposition, prompts, acceptance, promotion, artifacts).
 
 ## Limitations
 
